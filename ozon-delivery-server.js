@@ -65,16 +65,14 @@ let cachedToken = null;
 let tokenExpiresAt = 0;
 
 // Нужные скоупы — по списку разрешений, которые вам выдали в приложении
-const OZON_SCOPES = [
-  'delivery-api.delivery',
-  'delivery-api.delivery-point',
-  'delivery-api.dropoff-point',
-  'delivery-api.return-point',
-  'delivery-api.order',
-  'delivery-api.shipment-method',
-  'delivery-api.posting',
-  'delivery-api.return'
-];
+// ВАЖНО: раньше здесь был перечислен список отдельных разрешений
+// (delivery-api.delivery, delivery-api.dropoff-point и т.д.) — Ozon
+// ответил ошибкой "scope 'delivery-api.dropoff-point' is not approved"
+// на один из них, хотя в панели приложения все они значились как выданные.
+// Самый надёжный вариант — запросить delivery-api.all целиком: это
+// разрешение точно есть (было явно в списке при создании приложения) и
+// покрывает вообще все методы, включая все перечисленные по отдельности.
+const OZON_SCOPES = ['delivery-api.all'];
 
 async function getOzonToken() {
   const now = Date.now();
