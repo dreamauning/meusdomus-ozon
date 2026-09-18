@@ -141,10 +141,18 @@ const TRUSTED_CA = [...tls.rootCertificates, RUSSIAN_TRUSTED_ROOT_CA, RUSSIAN_TR
    Тинькофф. Возвращает {status, json} — вызывающий код сам решает, что
    делать со статусом (fetch() бросал исключение только на сетевом сбое,
    но не на HTTP-ошибках вроде 400 — здесь сохранено то же поведение). */
-function postJsonWithTrustedCA(url, bodyObj, extraHeaders) {
+/* ===== COOKIE ОТ ЗАЩИТЫ OZON ОТ DDoS (testcookie) =====
+   По документации Ozon: серверы защищены модулем testcookie — на первый
+   запрос к методу отвечают HTTP-редиректом (302/307) с заголовками
+   Location и Set-Cookie; нужно повторить ТОТ ЖЕ запрос по адресу из
+   Location, приложив полученную Cookie — и сохранить её для следующих
+   запросов, чтобы не проходить эту проверку каждый раз заново.
+   Храним по одной cookie на хост (xapi.ozon.ru и api-delivery.ozon.ru —
+   разные хосты, разные cookie). */
+var ozonCookieJar = {};
+
+function performHttpsRequest(urlObj, bodyStr, extraHeaders){
   return new Promise((resolve, reject) => {
-    const bodyStr = JSON.stringify(bodyObj || {});
-    const urlObj = new URL(url);
     const options = {
       hostname: urlObj.hostname,
       path: urlObj.pathname + urlObj.search,
@@ -161,7 +169,7 @@ function postJsonWithTrustedCA(url, bodyObj, extraHeaders) {
       let raw = '';
       response.on('data', (chunk) => { raw += chunk; });
       response.on('end', () => {
-        resolve({ status: response.statusCode, text: raw });
+        resolve({ status: response.statusCode, text: raw, headers: response.headers });
       });
     });
 
@@ -174,6 +182,34 @@ function postJsonWithTrustedCA(url, bodyObj, extraHeaders) {
     request.write(bodyStr);
     request.end();
   });
+}
+
+async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
+  if (redirectsLeft === undefined) redirectsLeft = 3;
+  const bodyStr = JSON.stringify(bodyObj || {});
+  const urlObj = new URL(url);
+  const headers = Object.assign({}, extraHeaders || {});
+  if (ozonCookieJar[urlObj.hostname]) {
+    headers['Cookie'] = ozonCookieJar[urlObj.hostname];
+  }
+
+  const result = await performHttpsRequest(urlObj, bodyStr, headers);
+
+  if ((result.status === 307 || result.status === 302) && redirectsLeft > 0) {
+    const setCookie = result.headers['set-cookie'];
+    if (setCookie && setCookie.length) {
+      // Set-Cookie может прийти несколькими строками — сохраняем все,
+      // склеенные через "; ", как и положено в заголовке Cookie запроса.
+      ozonCookieJar[urlObj.hostname] = setCookie.map(c => c.split(';')[0]).join('; ');
+    }
+    const location = result.headers['location'];
+    if (location) {
+      const nextUrl = new URL(location, url).toString(); // на случай относительного пути
+      return postJsonWithTrustedCA(nextUrl, bodyObj, extraHeaders, redirectsLeft - 1);
+    }
+  }
+
+  return { status: result.status, text: result.text };
 }
 
 // ===== ВАШИ ДАННЫЕ ОТ OZON =====
