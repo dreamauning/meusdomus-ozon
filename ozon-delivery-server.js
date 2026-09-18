@@ -511,8 +511,21 @@ app.listen(PORT, () => {
 app.get('/api/setup/find-dropoff', async (req, res) => {
   try {
     const search = (req.query.city || 'Москва').trim();
+    // ВАЖНО: Ozon требует is_bulky и viewport как ОБЯЗАТЕЛЬНЫЕ поля фильтра,
+    // хотя в примере документации они просто были частью примера, без
+    // явной пометки "required" — сервер ответил ошибкой валидации без них.
+    // is_bulky:false — ищем обычные (не крупногабаритные) пункты, это
+    // подходит для наших товаров. viewport — географические границы
+    // поиска; ниже — с запасом вся Москва и ближайшее Подмосковье.
     const result = await ozonApiCall('/v1/dropoff-point/search', {
-      filters: { address_search: search },
+      filters: {
+        address_search: search,
+        is_bulky: false,
+        viewport: {
+          left_bottom: { latitude: 55.49, longitude: 37.31 },
+          right_top: { latitude: 55.95, longitude: 37.97 }
+        }
+      },
       pagination: { limit: 50 }
     });
     res.json(result);
@@ -524,8 +537,19 @@ app.get('/api/setup/find-dropoff', async (req, res) => {
 app.get('/api/setup/find-return-point', async (req, res) => {
   try {
     const search = (req.query.city || 'Москва').trim();
+    // На всякий случай сразу добавляем viewport — по методу dropoff-point
+    // выяснилось, что Ozon требует его как обязательный, хотя в
+    // документации это было не явно. Параметр search сюда не подставляем
+    // напрямую (у этого метода в документации нет address_search в
+    // фильтрах — только shipment_method_id, viewport, types), но
+    // географические границы ограничивают поиск тем же районом.
     const result = await ozonApiCall('/v1/return-point/search', {
-      filters: {},
+      filters: {
+        viewport: {
+          left_bottom: { latitude: 55.49, longitude: 37.31 },
+          right_top: { latitude: 55.95, longitude: 37.97 }
+        }
+      },
       pagination: { limit: 50 }
     });
     res.json(result);
