@@ -1,0 +1,15 @@
+{
+  "name": "meusdomus-ozon-delivery",
+  "version": "1.0.0",
+  "main": "ozon-delivery-server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node ozon-delivery-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}
