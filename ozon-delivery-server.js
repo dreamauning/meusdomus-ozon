@@ -43,6 +43,7 @@ const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const tls = require('tls');
+const crypto = require('crypto');
 
 const app = express();
 app.use(cors());
@@ -226,6 +227,11 @@ const OZON_API_URL = 'https://api-delivery.ozon.ru';
 // по разовой настройке в самом низу этого файла, там всё по шагам.
 const OZON_SHIPMENT_METHOD_ID = 1020005030702880; // Meus Domus — dropoff, пункт МОСКВА_5043 (Авиамоторная ул., 6с4)
 
+// Тот же самый адрес Google-скрипта, что использует сайт (MD_PRODUCTS_FEED_URL
+// в Блоке 3) — нужен, чтобы прочитать данные заказа для создания отправки
+// и потом записать обратно настоящий трек-номер Ozon.
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+
 // ===== ТОКЕН ДОСТУПА: получаем и кэшируем =====
 let cachedToken = null;
 let tokenExpiresAt = 0;
@@ -263,11 +269,11 @@ async function getOzonToken() {
   return cachedToken;
 }
 
-async function ozonApiCall(endpoint, body) {
+async function ozonApiCall(endpoint, body, extraHeaders) {
   const token = await getOzonToken();
-  const result = await postJsonWithTrustedCA(`${OZON_API_URL}${endpoint}`, body || {}, {
+  const result = await postJsonWithTrustedCA(`${OZON_API_URL}${endpoint}`, body || {}, Object.assign({
     Authorization: `Bearer ${token}`
-  });
+  }, extraHeaders || {}));
   let json;
   try { json = JSON.parse(result.text); } catch (e) { json = null; }
   if (result.status < 200 || result.status >= 300) {
@@ -517,6 +523,137 @@ app.listen(PORT, () => {
  * Для удобства этих трёх шагов ниже есть временные служебные маршруты —
  * можно просто открыть их в браузере вместо ручных curl-запросов.
  */
+
+/* ==================== АВТОМАТИЧЕСКОЕ СОЗДАНИЕ НАСТОЯЩЕЙ ОТПРАВКИ ====================
+ * Менеджер нажимает ссылку прямо в Telegram-уведомлении об оплаченном
+ * заказе Ozon — этот маршрут делает всё, что раньше требовало ручного
+ * захода в кабинет Ozon: регистрирует заказ, подтверждает сборку,
+ * получает этикетку со штрихкодом, и сам записывает трек-номер обратно
+ * в Google Таблицу (что автоматически запускает письмо покупателю —
+ * ту же самую цепочку, что и обычный ручной ввод в колонку K).
+ * ==================================================================== */
+
+function idempotencyKeyFromOrderNumber(orderNumber) {
+  const hash = crypto.createHash('sha256').update(String(orderNumber)).digest('hex');
+  return [hash.slice(0,8), hash.slice(8,12), hash.slice(12,16), hash.slice(16,20), hash.slice(20,32)].join('-');
+}
+
+async function fetchOrderFromSheet(orderNumber) {
+  const url = APPS_SCRIPT_URL + '?action=order-lookup&orderNumber=' + encodeURIComponent(orderNumber);
+  const response = await fetch(url);
+  return await response.json();
+}
+
+async function writeTrackingToSheet(orderNumber, trackNumber) {
+  const response = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ type: 'set-tracking', orderNumber: orderNumber, trackNumber: trackNumber })
+  });
+  return await response.json();
+}
+
+function htmlPage(title, bodyHtml) {
+  return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + title + '</title>'
+    + '<style>'
+    + 'body{font-family:-apple-system,Arial,sans-serif; background:#F3F0EA; color:#2A1E15; padding:40px 20px; max-width:560px; margin:0 auto; line-height:1.6;}'
+    + 'h1{font-size:22px; margin-bottom:16px;}'
+    + '.card{background:#fff; border-radius:10px; padding:24px; box-shadow:0 2px 12px rgba(42,30,21,0.1);}'
+    + '.ok{color:#2E7D32;} .err{color:#A83C3C;}'
+    + 'a.btn{display:inline-block; margin-top:16px; background:#2A1E15; color:#fff; padding:12px 20px; border-radius:8px; text-decoration:none; font-weight:600;}'
+    + '</style></head><body><div class="card">' + bodyHtml + '</div></body></html>';
+}
+
+app.get('/api/create-ozon-order', async (req, res) => {
+  var orderNumber = String(req.query.orderNumber || '').trim();
+  if (!orderNumber) {
+    return res.status(400).send(htmlPage('Ошибка', '<h1 class="err">Не передан номер заказа</h1>'));
+  }
+
+  try {
+    var order = await fetchOrderFromSheet(orderNumber);
+    if (!order.found) {
+      return res.send(htmlPage('Заказ не найден', '<h1 class="err">Заказ не найден</h1><p>' + (order.error || 'Проверьте номер заказа.') + '</p>'));
+    }
+
+    if (order.trackNumber) {
+      return res.send(htmlPage('Уже создано', '<h1>Отправка уже была создана ранее</h1><p>Трек-номер: <b>' + order.trackNumber + '</b></p><p>Письмо покупателю уже отправлено, повторно ничего создавать не нужно.</p>'));
+    }
+
+    if (!order.ozonDeliveryPointId) {
+      return res.send(htmlPage('Не хватает данных', '<h1 class="err">У этого заказа не сохранён ID пункта выдачи Ozon</h1><p>Скорее всего, заказ был оформлен до подключения этой автоматизации — создайте отправку вручную в кабинете Ozon.</p>'));
+    }
+
+    var idempotencyKey = idempotencyKeyFromOrderNumber(orderNumber);
+    var cutoffAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    var itemNames = (order.items || []).map(function(i){ return i.name; }).join(', ') || ('Заказ ' + orderNumber);
+
+    var createBody = {
+      order_external_id: orderNumber,
+      recipient: {
+        phone_number: order.phone,
+        full_name: order.name || 'Покупатель Meus Domus'
+      },
+      delivery: {
+        delivery_point: { delivery_point_id: Number(order.ozonDeliveryPointId) }
+      },
+      postings: [{
+        request_id: 1,
+        posting_external_id: orderNumber,
+        shipment_method_id: OZON_SHIPMENT_METHOD_ID,
+        description: itemNames.slice(0, 160),
+        declared_value: { amount: Number(order.total || 0).toFixed(2), currency_code: 'RUB' },
+        cutoff_at: cutoffAt,
+        dimensions: {
+          weight_g: Number(order.weightGrams) || 500,
+          length_mm: 200, width_mm: 150, height_mm: 100
+        }
+      }]
+    };
+    if (order.dimensionsCm && typeof order.dimensionsCm === 'string' && order.dimensionsCm.indexOf('×') !== -1) {
+      var parts = order.dimensionsCm.split('×').map(function(n){ return parseInt(n, 10) * 10; });
+      if (parts.length === 3 && parts.every(function(n){ return !isNaN(n); })) {
+        createBody.postings[0].dimensions.length_mm = parts[0];
+        createBody.postings[0].dimensions.width_mm = parts[1];
+        createBody.postings[0].dimensions.height_mm = parts[2];
+      }
+    }
+
+    console.log('[create-ozon-order] Создаём заказ ' + orderNumber + ':', JSON.stringify(createBody));
+    var createResp = await ozonApiCall('/v1/order/create', createBody, { 'Idempotency-Key': idempotencyKey });
+    console.log('[create-ozon-order] Ответ order/create:', JSON.stringify(createResp));
+
+    var posting = createResp && createResp.postings && createResp.postings[0];
+    if (!posting || !posting.posting_number) {
+      return res.send(htmlPage('Ошибка создания', '<h1 class="err">Ozon не создал отправление</h1><pre>' + JSON.stringify(createResp) + '</pre>'));
+    }
+    var postingNumber = posting.posting_number;
+
+    console.log('[create-ozon-order] Подтверждаем отправление ' + postingNumber);
+    await ozonApiCall('/v1/posting/approve', { posting_number: postingNumber });
+
+    var labelResp = await ozonApiCall('/v1/posting/label', { posting_number: postingNumber });
+    var labelBase64 = labelResp && labelResp.file_content;
+
+    await writeTrackingToSheet(orderNumber, postingNumber);
+
+    var labelHtml = '<p>Этикетку не удалось получить автоматически — найдите отправление ' + postingNumber + ' в личном кабинете Ozon и распечатайте её оттуда.</p>';
+    if (labelBase64) {
+      labelHtml = '<a class="btn" href="data:application/pdf;base64,' + labelBase64 + '" download="ozon-' + postingNumber + '.pdf">Скачать этикетку (PDF)</a>';
+    }
+
+    res.send(htmlPage('Готово',
+      '<h1 class="ok">Отправка создана</h1>'
+      + '<p>Номер отправления Ozon: <b>' + postingNumber + '</b></p>'
+      + '<p>Трек-номер записан в таблицу — покупателю уже отправлено письмо с ним.</p>'
+      + labelHtml
+      + '<p style="margin-top:20px; font-size:14px; color:#6b5d4f;">Довезите посылку с этой этикеткой до пункта отгрузки Ozon (Авиамоторная ул., 6 стр. 4).</p>'
+    ));
+  } catch (err) {
+    console.error('[create-ozon-order] Ошибка:', err);
+    res.status(500).send(htmlPage('Ошибка', '<h1 class="err">Что-то пошло не так</h1><p>' + String(err.message || err) + '</p><p>Заказ ' + orderNumber + ' нужно будет создать вручную в кабинете Ozon.</p>'));
+  }
+});
 
 app.get('/api/setup/find-dropoff', async (req, res) => {
   try {
