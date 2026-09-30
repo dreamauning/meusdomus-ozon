@@ -1,64 +1,24 @@
-/**
- * MEUS DOMUS — сервер для интеграции с Ozon Delivery API (Ozon Доставка
- * для бизнеса)
- * ================================================================
- * ЗАЧЕМ ЭТОТ ФАЙЛ:
- * Тот же принцип, что и у сервера СДЭК и сервера Тинькофф — client_id и
- * client_secret нельзя вставлять в код сайта (их увидел бы кто угодно
- * через "Просмотр кода страницы"), поэтому они живут только здесь.
- *
- * ==================== ВАЖНО: ЭТА ИНТЕГРАЦИЯ УСТРОЕНА ИНАЧЕ, ЧЕМ СДЭК ===
- * У Ozon Delivery API другая архитектура — не просто "город → цена":
- *
- * 1. РАСЧЁТ ЦЕНЫ ТРЕБУЕТ ТЕЛЕФОН ПОКУПАТЕЛЯ. Метод, который считает
- *    стоимость (order/checkout), обязательно требует номер телефона
- *    получателя — доставка Ozon в принципе работает только для
- *    покупателей, у которых уже есть аккаунт на Ozon. Показать цену
- *    "просто по городу, без телефона" здесь невозможно технически —
- *    это не наша прихоть, а требование самого API.
- *
- * 2. СПИСОК ПУНКТОВ ВЫДАЧИ НЕ ФИЛЬТРУЕТСЯ ПО ГОРОДУ ЧЕРЕЗ API — метод
- *    delivery-point/list отдаёт вообще все пункты постранично, без
- *    параметра "город". Сервер сам кэширует полный список и фильтрует
- *    по тексту адреса на своей стороне.
- *
- * 3. ТРЕБУЕТСЯ РАЗОВАЯ НАСТРОЙКА ПЕРЕД ЗАПУСКОМ — нужно один раз создать
- *    "метод доставки" (shipment method), привязанный к ВАШЕМУ пункту
- *    отгрузки (куда вы физически сдаёте посылки Ozon) и пункту для
- *    возвратов. Без этого расчёт цены работать не будет вообще — Ozon
- *    попросту не поймёт, от какого склада считать доставку.
- *    См. инструкцию по разовой настройке в конце этого файла.
- * ========================================================================
- *
- * КАК ЗАПУСТИТЬ:
- * 1. npm init -y && npm install express cors
- * 2. Впишите ниже OZON_CLIENT_ID и OZON_CLIENT_SECRET
- * 3. Разместите на Render (или другом хостинге с Node.js)
- * 4. Выполните РАЗОВУЮ НАСТРОЙКУ (см. инструкцию в конце файла) — получите
- *    shipment_method_id и впишите его в переменную OZON_SHIPMENT_METHOD_ID
- * 5. После этого впишите адрес этого сервера в код сайта (Блок 1b)
- */
-
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
 const tls = require('tls');
 const crypto = require('crypto');
 
+const OZON_CLIENT_ID = 'ad91b8c0-3cab-4391-89c3-03aab63ac160';
+const OZON_CLIENT_SECRET = '849ac0c2d78440d0bf4f148071df66fce82f3136c3f87cc17189bb5f5c72dca2';
+const OZON_AUTH_URL = 'https://xapi.ozon.ru/oauth/token';
+const OZON_API_URL = 'https://api-delivery.ozon.ru';
+const OZON_SCOPES = ['delivery-api.all'];
+const OZON_SHIPMENT_METHOD_ID = 1020005030702880;
+const OZON_DROPOFF_ADDRESS = 'Авиамоторная ул., 6 стр. 4';
+const OZON_MARKUP_PERCENT = 5;
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ==================== РОССИЙСКИЙ СЕРТИФИКАТ МИНЦИФРЫ ====================
- * НАЙДЕНА ТА ЖЕ ПРИЧИНА, что уже чинили у сервера Тинькофф: "fetch failed"
- * без деталей — типичный признак того, что российский домен (здесь —
- * xapi.ozon.ru и api-delivery.ozon.ru) использует сертификат Russian
- * Trusted CA (Минцифры), которому Node.js не доверяет по умолчанию.
- * Встроенный fetch() не даёт удобного способа подсунуть свой список
- * доверенных сертификатов — поэтому, как и в сервере Тинькофф, здесь
- * используется вместо него старый добрый модуль https с явно указанным
- * списком доверенных сертификатов: обычные мировые (по умолчанию) +
- * российский Минцифры — то есть ДОБАВЛЯЕМ доверие, а не заменяем. */
 const RUSSIAN_TRUSTED_ROOT_CA = `-----BEGIN CERTIFICATE-----
 MIIFwjCCA6qgAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwcDELMAkGA1UEBhMCUlUx
 PzA9BgNVBAoMNlRoZSBNaW5pc3RyeSBvZiBEaWdpdGFsIERldmVsb3BtZW50IGFu
@@ -137,19 +97,6 @@ ZHuNM/m0TXt2wTTPL7JH2YC0gPz/BvvSzjksgzU5rLbRyUKQkgU=
 
 const TRUSTED_CA = [...tls.rootCertificates, RUSSIAN_TRUSTED_ROOT_CA, RUSSIAN_TRUSTED_SUB_CA];
 
-/* Замена fetch() на встроенный https-модуль с расширенным списком
-   доверенных сертификатов — та же проверенная схема, что и в сервере
-   Тинькофф. Возвращает {status, json} — вызывающий код сам решает, что
-   делать со статусом (fetch() бросал исключение только на сетевом сбое,
-   но не на HTTP-ошибках вроде 400 — здесь сохранено то же поведение). */
-/* ===== COOKIE ОТ ЗАЩИТЫ OZON ОТ DDoS (testcookie) =====
-   По документации Ozon: серверы защищены модулем testcookie — на первый
-   запрос к методу отвечают HTTP-редиректом (302/307) с заголовками
-   Location и Set-Cookie; нужно повторить ТОТ ЖЕ запрос по адресу из
-   Location, приложив полученную Cookie — и сохранить её для следующих
-   запросов, чтобы не проходить эту проверку каждый раз заново.
-   Храним по одной cookie на хост (xapi.ozon.ru и api-delivery.ozon.ru —
-   разные хосты, разные cookie). */
 var ozonCookieJar = {};
 
 function performHttpsRequest(urlObj, bodyStr, extraHeaders){
@@ -199,13 +146,11 @@ async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
   if ((result.status === 307 || result.status === 302) && redirectsLeft > 0) {
     const setCookie = result.headers['set-cookie'];
     if (setCookie && setCookie.length) {
-      // Set-Cookie может прийти несколькими строками — сохраняем все,
-      // склеенные через "; ", как и положено в заголовке Cookie запроса.
       ozonCookieJar[urlObj.hostname] = setCookie.map(c => c.split(';')[0]).join('; ');
     }
     const location = result.headers['location'];
     if (location) {
-      const nextUrl = new URL(location, url).toString(); // на случай относительного пути
+      const nextUrl = new URL(location, url).toString();
       return postJsonWithTrustedCA(nextUrl, bodyObj, extraHeaders, redirectsLeft - 1);
     }
   }
@@ -213,38 +158,8 @@ async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
   return { status: result.status, text: result.text };
 }
 
-// ===== ВАШИ ДАННЫЕ ОТ OZON =====
-const OZON_CLIENT_ID = 'ad91b8c0-3cab-4391-89c3-03aab63ac160';
-const OZON_CLIENT_SECRET = '849ac0c2d78440d0bf4f148071df66fce82f3136c3f87cc17189bb5f5c72dca2';
-
-const OZON_AUTH_URL = 'https://xapi.ozon.ru/oauth/token';
-const OZON_API_URL = 'https://api-delivery.ozon.ru';
-
-// ===== РАЗОВАЯ НАСТРОЙКА: ID МЕТОДА ДОСТАВКИ =====
-// ВАЖНО: пока здесь стоит null, расчёт цены и показ пунктов выдачи
-// работать НЕ БУДУТ — сервер честно ответит ошибкой с понятным текстом,
-// а не сломает сайт молча. Чтобы получить это значение — см. инструкцию
-// по разовой настройке в самом низу этого файла, там всё по шагам.
-const OZON_SHIPMENT_METHOD_ID = 1020005030702880; // Meus Domus — dropoff, пункт МОСКВА_5043 (Авиамоторная ул., 6с4)
-
-// Тот же самый адрес Google-скрипта, что использует сайт (MD_PRODUCTS_FEED_URL
-// в Блоке 3) — нужен, чтобы прочитать данные заказа для создания отправки
-// и потом записать обратно настоящий трек-номер Ozon.
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
-
-// ===== ТОКЕН ДОСТУПА: получаем и кэшируем =====
 let cachedToken = null;
 let tokenExpiresAt = 0;
-
-// Нужные скоупы — по списку разрешений, которые вам выдали в приложении
-// ВАЖНО: раньше здесь был перечислен список отдельных разрешений
-// (delivery-api.delivery, delivery-api.dropoff-point и т.д.) — Ozon
-// ответил ошибкой "scope 'delivery-api.dropoff-point' is not approved"
-// на один из них, хотя в панели приложения все они значились как выданные.
-// Самый надёжный вариант — запросить delivery-api.all целиком: это
-// разрешение точно есть (было явно в списке при создании приложения) и
-// покрывает вообще все методы, включая все перечисленные по отдельности.
-const OZON_SCOPES = ['delivery-api.all'];
 
 async function getOzonToken() {
   const now = Date.now();
@@ -285,14 +200,8 @@ async function ozonApiCall(endpoint, body, extraHeaders) {
   return json;
 }
 
-// ===== КЭШ ПУНКТОВ ВЫДАЧИ =====
-// delivery-point/list не умеет фильтровать по городу — забираем ВСЕ
-// страницы один раз и держим в памяти, обновляя раз в несколько часов
-// (список пунктов не меняется поминутно, нет смысла запрашивать заново
-// на каждый чих покупателя).
 let deliveryPointsCache = [];
 let deliveryPointsCachedAt = 0;
-const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000; // 4 часа
 
 async function getAllDeliveryPoints() {
   const now = Date.now();
@@ -303,7 +212,7 @@ async function getAllDeliveryPoints() {
   console.log('[ozon] Обновляем кэш пунктов выдачи...');
   let allPoints = [];
   let cursor = undefined;
-  let pageGuard = 0; // защита от бесконечного цикла, если Ozon вдруг зациклит курсор
+  let pageGuard = 0;
 
   do {
     const page = await ozonApiCall('/v1/delivery-point/list', {
@@ -314,12 +223,8 @@ async function getAllDeliveryPoints() {
     }
     cursor = page && page.next_cursor ? page.next_cursor : null;
     pageGuard++;
-  } while (cursor && pageGuard < 200); // 200 страниц по 100 = 20000 пунктов, с большим запасом
+  } while (cursor && pageGuard < 200);
 
-  // Список пунктов из /v1/delivery-point/list содержит только id — полные
-  // данные (адрес, координаты, график) нужно дозапросить отдельно, но это
-  // может быть МНОГО пунктов сразу — Ozon разрешает не больше 100 id за раз
-  // в /v1/delivery-point/info, поэтому запрашиваем пачками.
   var fullPoints = [];
   for (let i = 0; i < allPoints.length; i += 100) {
     const batchIds = allPoints.slice(i, i + 100).map(p => p.delivery_point_id);
@@ -336,7 +241,6 @@ async function getAllDeliveryPoints() {
   return deliveryPointsCache;
 }
 
-// ===== ЭНДПОИНТ: ПУНКТЫ ВЫДАЧИ ПО ГОРОДУ =====
 app.get('/api/ozon-points', async (req, res) => {
   try {
     const cityName = (req.query.city || '').trim().toLowerCase();
@@ -345,9 +249,6 @@ app.get('/api/ozon-points', async (req, res) => {
     }
 
     const allPoints = await getAllDeliveryPoints();
-    // Фильтруем по вхождению названия города в полный адрес пункта —
-    // единственный доступный способ, раз у Ozon нет отдельного поля "город"
-    // и нет фильтра по городу в самом API.
     const matched = allPoints.filter(p =>
       p.is_active && (p.full_address || '').toLowerCase().indexOf(cityName) !== -1
     );
@@ -369,15 +270,8 @@ app.get('/api/ozon-points', async (req, res) => {
   }
 });
 
-// ===== ЭНДПОИНТ: РАСЧЁТ РЕАЛЬНОЙ СТОИМОСТИ ДОСТАВКИ =====
-// ВАЖНО: требует phone (номер телефона покупателя) — без него Ozon в
-// принципе не считает доставку, см. пояснение вверху файла.
 app.get('/api/ozon-calculate', async (req, res) => {
   try {
-    if (!OZON_SHIPMENT_METHOD_ID) {
-      console.error('[ozon-calculate] OZON_SHIPMENT_METHOD_ID не настроен — см. инструкцию по разовой настройке внизу файла');
-      return res.json({ found: false, error: 'Метод доставки Ozon ещё не настроен на сервере' });
-    }
 
     const phone = (req.query.phone || '').trim();
     const deliveryPointIdRaw = (req.query.deliveryPointId || '').trim();
@@ -395,9 +289,6 @@ app.get('/api/ozon-calculate', async (req, res) => {
     }
     const deliveryPointId = parseInt(deliveryPointIdRaw.replace(/^ozon-/, ''), 10);
 
-    // Шаг 1: проверяем, что покупатель вообще может получать доставку Ozon
-    // (у него должен быть аккаунт на Ozon) — честно говорим сайту, если нет,
-    // а не притворяемся, что доставка возможна.
     let clientCheck;
     try {
       clientCheck = await ozonApiCall('/v1/delivery/check-client', { phone_number: phone });
@@ -413,8 +304,7 @@ app.get('/api/ozon-calculate', async (req, res) => {
       });
     }
 
-    // Шаг 2: считаем цену через order/checkout
-    const cutoffAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // ближайшая отгрузка — завтра
+    const cutoffAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
     const requestBody = {
       recipient: { phone_number: phone },
       postings: [{
@@ -454,10 +344,6 @@ app.get('/api/ozon-calculate', async (req, res) => {
     const deliveryCost = parseFloat(result.posting.estimated_delivery_cost && result.posting.estimated_delivery_cost.amount || 0);
     const insuranceCost = parseFloat(result.posting.estimated_insurance_cost && result.posting.estimated_insurance_cost.amount || 0);
 
-    // ===== ТА ЖЕ НАЦЕНКА, ЧТО И У СДЭК =====
-    // См. пояснение в сервере СДЭК (CDEK_MARKUP_PERCENT) — тот же принцип,
-    // то же значение, для единообразия между службами доставки.
-    const OZON_MARKUP_PERCENT = 5;
     const totalRealCost = deliveryCost + insuranceCost;
     const costWithMarkup = Math.round(totalRealCost * (1 + OZON_MARKUP_PERCENT / 100));
 
@@ -472,66 +358,6 @@ app.get('/api/ozon-calculate', async (req, res) => {
     res.json({ found: false, error: String(err.message || err) });
   }
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Сервер Ozon Delivery запущен на порту ${PORT}`);
-  // Прогреваем кэш пунктов выдачи сразу при старте — без этого первый же
-  // реальный покупатель, выбравший Ozon, вынудил бы сервер собирать
-  // тысячи пунктов по всей стране прямо во время оформления его заказа,
-  // а это может занять неприлично долго и почувствоваться как "сайт
-  // повис". Если прогрев не удастся (например, сервер стартовал раньше,
-  // чем токен получилось выдать) — это не критично, кэш всё равно
-  // соберётся при первом обращении, просто медленнее для того покупателя.
-  if (OZON_SHIPMENT_METHOD_ID) {
-    getAllDeliveryPoints().catch(err => console.error('[ozon] Не удалось прогреть кэш при старте:', err.message));
-  }
-});
-
-/**
- * ==================== РАЗОВАЯ НАСТРОЙКА — СДЕЛАТЬ ОДИН РАЗ ПЕРЕД ЗАПУСКОМ ====================
- *
- * Без этого шага расчёт цены и список пунктов выдачи работать не будут —
- * сервер будет честно отвечать "метод доставки ещё не настроен".
- *
- * ШАГ 1. Найдите ваш пункт отгрузки (куда вы физически сдаёте посылки Ozon)
- *
- * Откройте в браузере (после того как сервер задеплоен):
- *   https://ваш-сервер.onrender.com/api/setup/find-dropoff?city=Москва
- *
- * (добавьте временный маршрут ниже, если хотите вызвать это через браузер,
- * либо выполните запрос напрямую через curl/Postman к самому Ozon —
- * см. пример в документации: POST /v1/dropoff-point/search с телом
- * {"filters":{"address_search":"Москва"},"pagination":{"limit":50}})
- *
- * Найдите в ответе dropoff_point_id того пункта, что ближе всего к вашему
- * реальному адресу (2-я Фрезерная улица, 14 стр. 1А, Москва).
- *
- * ШАГ 2. Так же найдите пункт для возвратов (POST /v1/return-point/search)
- *
- * ШАГ 3. Создайте метод доставки (POST /v1/shipment-method/create):
- *   {
- *     "name": "Meus Domus — dropoff",
- *     "phone_number": "+79774444141",
- *     "is_bulky": false,
- *     "type": { "dropoff": { "dropoff_point_id": <из шага 1>, "return_point_id": <из шага 2> } }
- *   }
- *
- * Ozon вернёт shipment_method_id — впишите это число в переменную
- * OZON_SHIPMENT_METHOD_ID в начале этого файла.
- *
- * Для удобства этих трёх шагов ниже есть временные служебные маршруты —
- * можно просто открыть их в браузере вместо ручных curl-запросов.
- */
-
-/* ==================== АВТОМАТИЧЕСКОЕ СОЗДАНИЕ НАСТОЯЩЕЙ ОТПРАВКИ ====================
- * Менеджер нажимает ссылку прямо в Telegram-уведомлении об оплаченном
- * заказе Ozon — этот маршрут делает всё, что раньше требовало ручного
- * захода в кабинет Ozon: регистрирует заказ, подтверждает сборку,
- * получает этикетку со штрихкодом, и сам записывает трек-номер обратно
- * в Google Таблицу (что автоматически запускает письмо покупателю —
- * ту же самую цепочку, что и обычный ручной ввод в колонку K).
- * ==================================================================== */
 
 function idempotencyKeyFromOrderNumber(orderNumber) {
   const hash = crypto.createHash('sha256').update(String(orderNumber)).digest('hex');
@@ -647,7 +473,7 @@ app.get('/api/create-ozon-order', async (req, res) => {
       + '<p>Номер отправления Ozon: <b>' + postingNumber + '</b></p>'
       + '<p>Трек-номер записан в таблицу — покупателю уже отправлено письмо с ним.</p>'
       + labelHtml
-      + '<p style="margin-top:20px; font-size:14px; color:#6b5d4f;">Довезите посылку с этой этикеткой до пункта отгрузки Ozon (Авиамоторная ул., 6 стр. 4).</p>'
+      + '<p style="margin-top:20px; font-size:14px; color:#6b5d4f;">Довезите посылку с этой этикеткой до пункта отгрузки Ozon (' + OZON_DROPOFF_ADDRESS + ').</p>'
     ));
   } catch (err) {
     console.error('[create-ozon-order] Ошибка:', err);
@@ -655,71 +481,8 @@ app.get('/api/create-ozon-order', async (req, res) => {
   }
 });
 
-app.get('/api/setup/find-dropoff', async (req, res) => {
-  try {
-    const search = (req.query.city || 'Москва').trim();
-    // ВАЖНО: Ozon требует is_bulky и viewport как ОБЯЗАТЕЛЬНЫЕ поля фильтра,
-    // хотя в примере документации они просто были частью примера, без
-    // явной пометки "required" — сервер ответил ошибкой валидации без них.
-    // is_bulky:false — ищем обычные (не крупногабаритные) пункты, это
-    // подходит для наших товаров. viewport — географические границы
-    // поиска; ниже — с запасом вся Москва и ближайшее Подмосковье.
-    const result = await ozonApiCall('/v1/dropoff-point/search', {
-      filters: {
-        address_search: search,
-        is_bulky: false,
-        viewport: {
-          left_bottom: { latitude: 55.49, longitude: 37.31 },
-          right_top: { latitude: 55.95, longitude: 37.97 }
-        }
-      },
-      pagination: { limit: 50 }
-    });
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-app.get('/api/setup/find-return-point', async (req, res) => {
-  try {
-    const search = (req.query.city || 'Москва').trim();
-    // На всякий случай сразу добавляем viewport — по методу dropoff-point
-    // выяснилось, что Ozon требует его как обязательный, хотя в
-    // документации это было не явно. Параметр search сюда не подставляем
-    // напрямую (у этого метода в документации нет address_search в
-    // фильтрах — только shipment_method_id, viewport, types), но
-    // географические границы ограничивают поиск тем же районом.
-    const result = await ozonApiCall('/v1/return-point/search', {
-      filters: {
-        viewport: {
-          left_bottom: { latitude: 55.49, longitude: 37.31 },
-          right_top: { latitude: 55.95, longitude: 37.97 }
-        }
-      },
-      pagination: { limit: 50 }
-    });
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
-});
-
-app.get('/api/setup/create-shipment-method', async (req, res) => {
-  try {
-    const dropoffId = parseInt(req.query.dropoffId, 10);
-    const returnId = parseInt(req.query.returnId, 10);
-    if (!dropoffId || !returnId) {
-      return res.status(400).json({ error: 'Передайте dropoffId и returnId параметрами запроса' });
-    }
-    const result = await ozonApiCall('/v1/shipment-method/create', {
-      name: 'Meus Domus — dropoff',
-      phone_number: '+79774444141',
-      is_bulky: false,
-      type: { dropoff: { dropoff_point_id: dropoffId, return_point_id: returnId } }
-    });
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: String(err.message || err) });
-  }
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Сервер Ozon Delivery запущен на порту ${PORT}`);
+  getAllDeliveryPoints().catch(err => console.error('[ozon] Не удалось прогреть кэш при старте:', err.message));
 });
