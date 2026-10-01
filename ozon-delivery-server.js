@@ -12,6 +12,7 @@ const OZON_SCOPES = ['delivery-api.all'];
 const OZON_SHIPMENT_METHOD_ID = 1020005030702880;
 const OZON_DROPOFF_ADDRESS = 'Авиамоторная ул., 6 стр. 4';
 const OZON_MARKUP_PERCENT = 5;
+const OZON_DEBUG_KEY = 'md-diag-5f81c2';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
 const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 
@@ -270,92 +271,138 @@ app.get('/api/ozon-points', async (req, res) => {
   }
 });
 
-app.get('/api/ozon-calculate', async (req, res) => {
+function readAmount(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string') return isNaN(parseFloat(value)) ? null : parseFloat(value);
+  if (value.amount !== undefined) return readAmount(value.amount);
+  if (value.value !== undefined) return readAmount(value.value);
+  return null;
+}
+
+function firstDefined(obj, keys) {
+  for (const key of keys) {
+    if (obj && obj[key] !== undefined && obj[key] !== null) return obj[key];
+  }
+  return undefined;
+}
+
+function extractPosting(resp) {
+  const result = resp && Array.isArray(resp.results) ? resp.results[0] : null;
+  return (result && result.posting) || result || (resp && Array.isArray(resp.postings) ? resp.postings[0] : null);
+}
+
+function ozonErrorText(err) {
+  const r = err && err.ozonResponse;
+  const msg = (r && (r.message || (r.error && r.error.message))) || (err && err.message) || 'неизвестная ошибка';
+  return String(msg).slice(0, 160);
+}
+
+function buildCheckoutBody(phone, deliveryPointId, pkg, declaredValueRub) {
+  return {
+    recipient: { phone_number: phone },
+    postings: [{
+      request_id: 1,
+      shipment_method_id: OZON_SHIPMENT_METHOD_ID,
+      cutoff_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      declared_value: { amount: declaredValueRub.toFixed(2), currency_code: 'RUB' },
+      dimensions: {
+        weight_g: pkg.weightGrams,
+        length_mm: pkg.lengthCm * 10,
+        width_mm: pkg.widthCm * 10,
+        height_mm: pkg.heightCm * 10
+      }
+    }],
+    delivery: { delivery_point: { delivery_point_id: deliveryPointId } }
+  };
+}
+
+function readCalculateParams(query) {
+  return {
+    phone: String(query.phone || '').trim(),
+    deliveryPointId: parseInt(String(query.deliveryPointId || '').replace(/^ozon-/, ''), 10),
+    pkg: {
+      weightGrams: parseInt(query.weight, 10) || 500,
+      lengthCm: parseInt(query.length, 10) || 20,
+      widthCm: parseInt(query.width, 10) || 15,
+      heightCm: parseInt(query.height, 10) || 10
+    },
+    declaredValueRub: parseFloat(query.declaredValue) || 0
+  };
+}
+
+async function calculateOzonDelivery(params) {
+  const trace = {};
+
   try {
+    trace.checkClient = await ozonApiCall('/v1/delivery/check-client', { phone_number: params.phone });
+  } catch (err) {
+    trace.checkClientError = ozonErrorText(err);
+    console.error('[ozon-calculate] check-client:', trace.checkClientError);
+  }
+  const eligible = firstDefined(trace.checkClient, ['can_be_delivered', 'is_available', 'available']);
+  if (eligible === false) {
+    return { found: false, clientNotEligible: true, error: 'нет аккаунта на Ozon', trace };
+  }
 
-    const phone = (req.query.phone || '').trim();
-    const deliveryPointIdRaw = (req.query.deliveryPointId || '').trim();
-    const weightGrams = parseInt(req.query.weight, 10) || 500;
-    const lengthCm = parseInt(req.query.length, 10) || 20;
-    const widthCm = parseInt(req.query.width, 10) || 15;
-    const heightCm = parseInt(req.query.height, 10) || 10;
-    const declaredValueRub = parseFloat(req.query.declaredValue) || 0;
+  const body = buildCheckoutBody(params.phone, params.deliveryPointId, params.pkg, params.declaredValueRub);
+  trace.checkoutRequest = body;
+  try {
+    trace.checkout = await ozonApiCall('/v1/order/checkout', body);
+  } catch (err) {
+    trace.checkoutError = ozonErrorText(err);
+    console.error('[ozon-calculate] checkout:', trace.checkoutError, JSON.stringify(err.ozonResponse || ''));
+    return { found: false, error: 'Ozon: ' + trace.checkoutError, trace };
+  }
+  console.log('[ozon-calculate] checkout:', JSON.stringify(trace.checkout));
 
-    if (!phone) {
-      return res.json({ found: false, error: 'Не передан телефон покупателя' });
-    }
-    if (!deliveryPointIdRaw) {
-      return res.json({ found: false, error: 'Не выбран пункт выдачи' });
-    }
-    const deliveryPointId = parseInt(deliveryPointIdRaw.replace(/^ozon-/, ''), 10);
+  const posting = extractPosting(trace.checkout);
+  if (!posting) {
+    return { found: false, error: 'Ozon не вернул расчёт', trace };
+  }
+  if (posting.error) {
+    return { found: false, error: 'Ozon: ' + String(posting.error.message || posting.error).slice(0, 160), trace };
+  }
 
-    let clientCheck;
-    try {
-      clientCheck = await ozonApiCall('/v1/delivery/check-client', { phone_number: phone });
-    } catch (checkErr) {
-      console.error('[ozon-calculate] Ошибка проверки клиента:', checkErr.message);
-      return res.json({ found: false, error: 'Не удалось проверить доступность доставки для этого номера' });
-    }
-    if (!clientCheck || !clientCheck.can_be_delivered) {
-      return res.json({
-        found: false,
-        error: 'Доставка Ozon недоступна для этого номера телефона (нет аккаунта на Ozon)',
-        clientNotEligible: true
-      });
-    }
+  const deliveryCost = readAmount(firstDefined(posting, ['estimated_delivery_cost', 'delivery_cost', 'delivery_price', 'price']));
+  if (deliveryCost === null) {
+    return { found: false, error: 'Ozon не вернул стоимость', trace };
+  }
+  const insuranceCost = readAmount(firstDefined(posting, ['estimated_insurance_cost', 'insurance_cost'])) || 0;
+  const days = firstDefined(posting, ['estimated_delivery_days', 'delivery_days', 'days']);
 
-    const cutoffAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-    const requestBody = {
-      recipient: { phone_number: phone },
-      postings: [{
-        request_id: 1,
-        shipment_method_id: OZON_SHIPMENT_METHOD_ID,
-        cutoff_at: cutoffAt,
-        declared_value: { amount: declaredValueRub.toFixed(2), currency_code: 'RUB' },
-        dimensions: {
-          weight_g: weightGrams,
-          length_mm: lengthCm * 10,
-          width_mm: widthCm * 10,
-          height_mm: heightCm * 10
-        }
-      }],
-      delivery: { delivery_point: { delivery_point_id: deliveryPointId } }
-    };
+  return {
+    found: true,
+    cost: Math.round((deliveryCost + insuranceCost) * (1 + OZON_MARKUP_PERCENT / 100)),
+    realCost: deliveryCost,
+    insuranceCost: insuranceCost,
+    periodMinDays: days,
+    periodMaxDays: days,
+    trace
+  };
+}
 
-    console.log(`[ozon-calculate] Запрос checkout: телефон=${phone}, пункт=${deliveryPointId}, вес=${weightGrams}г, габариты=${lengthCm}×${widthCm}×${heightCm}см, объявл.стоимость=${declaredValueRub}₽`);
-
-    let checkoutResp;
-    try {
-      checkoutResp = await ozonApiCall('/v1/order/checkout', requestBody);
-    } catch (checkoutErr) {
-      console.error('[ozon-calculate] Ошибка checkout:', checkoutErr.message, checkoutErr.ozonResponse || '');
-      return res.json({ found: false, error: 'Не удалось рассчитать доставку' });
-    }
-
-    console.log('[ozon-calculate] Сырой ответ checkout:', JSON.stringify(checkoutResp));
-
-    const result = checkoutResp && Array.isArray(checkoutResp.results) ? checkoutResp.results[0] : null;
-    if (!result || !result.posting || result.posting.error) {
-      const errMsg = result && result.posting && result.posting.error ? result.posting.error.message : 'неизвестная ошибка';
-      console.error('[ozon-calculate] Ozon вернул ошибку по отправлению:', errMsg);
-      return res.json({ found: false, error: errMsg });
-    }
-
-    const deliveryCost = parseFloat(result.posting.estimated_delivery_cost && result.posting.estimated_delivery_cost.amount || 0);
-    const insuranceCost = parseFloat(result.posting.estimated_insurance_cost && result.posting.estimated_insurance_cost.amount || 0);
-
-    const totalRealCost = deliveryCost + insuranceCost;
-    const costWithMarkup = Math.round(totalRealCost * (1 + OZON_MARKUP_PERCENT / 100));
-
-    res.json({
-      found: true,
-      cost: costWithMarkup,
-      periodMinDays: result.posting.estimated_delivery_days,
-      periodMaxDays: result.posting.estimated_delivery_days
-    });
+app.get('/api/ozon-calculate', async (req, res) => {
+  const params = readCalculateParams(req.query);
+  if (!params.phone) return res.json({ found: false, error: 'не указан телефон' });
+  if (!params.deliveryPointId) return res.json({ found: false, error: 'не выбран пункт выдачи' });
+  try {
+    const result = await calculateOzonDelivery(params);
+    delete result.trace;
+    res.json(result);
   } catch (err) {
     console.error('[ozon-calculate] Ошибка:', err);
-    res.json({ found: false, error: String(err.message || err) });
+    res.json({ found: false, error: 'сбой сервера расчёта' });
+  }
+});
+
+app.get('/api/ozon-debug', async (req, res) => {
+  if (req.query.key !== OZON_DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
+  const params = readCalculateParams(req.query);
+  try {
+    res.json(await calculateOzonDelivery(params));
+  } catch (err) {
+    res.json({ error: String(err.message || err) });
   }
 });
 
