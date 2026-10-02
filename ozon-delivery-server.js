@@ -12,6 +12,7 @@ const OZON_SCOPES = ['delivery-api.all'];
 const OZON_SHIPMENT_METHOD_ID = 1020005030702880;
 const OZON_DROPOFF_ADDRESS = 'Авиамоторная ул., 6 стр. 4';
 const OZON_MARKUP_PERCENT = 5;
+const OZON_MIN_DECLARED_VALUE = 500;
 const OZON_DEBUG_KEY = 'md-diag-5f81c2';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
 const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
@@ -444,7 +445,7 @@ async function calculateOzonDelivery(params) {
     return { found: false, clientNotEligible: true, error: 'нет аккаунта на Ozon', trace };
   }
 
-  const body = buildCheckoutBody(params.phone, params.deliveryPointId, params.pkg, params.declaredValueRub);
+  const body = buildCheckoutBody(params.phone, params.deliveryPointId, params.pkg, Math.max(params.declaredValueRub, OZON_MIN_DECLARED_VALUE));
   trace.checkoutRequest = body;
   const logRefusal = (reason) => {
     const point = deliveryPointsById.get(Number(params.deliveryPointId));
@@ -454,7 +455,7 @@ async function calculateOzonDelivery(params) {
       phone: params.phone.replace(/\d(?=\d{4})/g, '*'),
       weightGrams: params.pkg.weightGrams,
       dimensionsCm: [params.pkg.lengthCm, params.pkg.widthCm, params.pkg.heightCm].join('×'),
-      declaredValue: params.declaredValueRub,
+      declaredValue: body.postings[0].declared_value.amount,
       cutoffAt: body.postings[0].cutoff_at
     }));
   };
@@ -661,7 +662,7 @@ app.get('/api/create-ozon-order', async (req, res) => {
         posting_external_id: orderNumber,
         shipment_method_id: OZON_SHIPMENT_METHOD_ID,
         description: itemNames.slice(0, 160),
-        declared_value: { amount: Number(order.total || 0).toFixed(2), currency_code: 'RUB' },
+        declared_value: { amount: Math.max(Number(order.total || 0), OZON_MIN_DECLARED_VALUE).toFixed(2), currency_code: 'RUB' },
         cutoff_at: cutoffAt,
         dimensions: {
           weight_g: Number(order.weightGrams) || 500,
