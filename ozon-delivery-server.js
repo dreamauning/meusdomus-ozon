@@ -16,7 +16,9 @@ const OZON_DEBUG_KEY = 'md-diag-5f81c2';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
 const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const DELIVERY_POINTS_MAX_PAGES = 3000;
-const DELIVERY_POINTS_PARALLEL = 5;
+const DELIVERY_POINTS_PARALLEL = 2;
+const DEFAULT_TIMEOUT_MS = 20000;
+const LONG_TIMEOUT_MS = 60000;
 
 const app = express();
 app.use(cors());
@@ -102,7 +104,8 @@ const TRUSTED_CA = [...tls.rootCertificates, RUSSIAN_TRUSTED_ROOT_CA, RUSSIAN_TR
 
 var ozonCookieJar = {};
 
-function performHttpsRequest(urlObj, bodyStr, extraHeaders){
+function performHttpsRequest(urlObj, bodyStr, extraHeaders, timeoutMs){
+  const limitMs = timeoutMs || DEFAULT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     const options = {
       hostname: urlObj.hostname,
@@ -113,7 +116,7 @@ function performHttpsRequest(urlObj, bodyStr, extraHeaders){
         'Content-Length': Buffer.byteLength(bodyStr)
       }, extraHeaders || {}),
       ca: TRUSTED_CA,
-      timeout: 20000
+      timeout: limitMs
     };
 
     const request = https.request(options, (response) => {
@@ -126,7 +129,7 @@ function performHttpsRequest(urlObj, bodyStr, extraHeaders){
 
     request.on('timeout', () => {
       request.destroy();
-      reject(new Error('Запрос не получил ответ за 20 секунд (таймаут)'));
+      reject(new Error('Запрос не получил ответ за ' + Math.round(limitMs / 1000) + ' секунд (таймаут)'));
     });
     request.on('error', (err) => { reject(err); });
 
@@ -135,7 +138,7 @@ function performHttpsRequest(urlObj, bodyStr, extraHeaders){
   });
 }
 
-async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
+async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft, timeoutMs){
   if (redirectsLeft === undefined) redirectsLeft = 3;
   const bodyStr = JSON.stringify(bodyObj || {});
   const urlObj = new URL(url);
@@ -144,7 +147,7 @@ async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
     headers['Cookie'] = ozonCookieJar[urlObj.hostname];
   }
 
-  const result = await performHttpsRequest(urlObj, bodyStr, headers);
+  const result = await performHttpsRequest(urlObj, bodyStr, headers, timeoutMs);
 
   if ((result.status === 307 || result.status === 302) && redirectsLeft > 0) {
     const setCookie = result.headers['set-cookie'];
@@ -154,7 +157,7 @@ async function postJsonWithTrustedCA(url, bodyObj, extraHeaders, redirectsLeft){
     const location = result.headers['location'];
     if (location) {
       const nextUrl = new URL(location, url).toString();
-      return postJsonWithTrustedCA(nextUrl, bodyObj, extraHeaders, redirectsLeft - 1);
+      return postJsonWithTrustedCA(nextUrl, bodyObj, extraHeaders, redirectsLeft - 1, timeoutMs);
     }
   }
 
@@ -187,11 +190,11 @@ async function getOzonToken() {
   return cachedToken;
 }
 
-async function ozonApiCall(endpoint, body, extraHeaders) {
+async function ozonApiCall(endpoint, body, extraHeaders, timeoutMs) {
   const token = await getOzonToken();
   const result = await postJsonWithTrustedCA(`${OZON_API_URL}${endpoint}`, body || {}, Object.assign({
     Authorization: `Bearer ${token}`
-  }, extraHeaders || {}));
+  }, extraHeaders || {}), undefined, timeoutMs);
   let json;
   try { json = JSON.parse(result.text); } catch (e) { json = null; }
   if (result.status < 200 || result.status >= 300) {
@@ -206,13 +209,27 @@ async function ozonApiCall(endpoint, body, extraHeaders) {
 let deliveryPointsCache = [];
 let deliveryPointsCachedAt = 0;
 
+async function ozonApiCallWithRetry(endpoint, body) {
+  const delaysMs = [2000, 5000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await ozonApiCall(endpoint, body, null, LONG_TIMEOUT_MS);
+    } catch (err) {
+      const retriable = !err.status || err.status === 429 || err.status >= 500;
+      if (!retriable || attempt >= delaysMs.length) throw err;
+      console.warn(`[ozon] ${endpoint}: ${err.message} — повтор через ${delaysMs[attempt] / 1000} с`);
+      await new Promise(resolve => setTimeout(resolve, delaysMs[attempt]));
+    }
+  }
+}
+
 async function loadAllDeliveryPoints() {
   console.log('[ozon] Обновляем кэш пунктов выдачи...');
   const ids = [];
   let cursor;
   let pages = 0;
   do {
-    const page = await ozonApiCall('/v1/delivery-point/list', { pagination: { cursor: cursor, limit: 100 } });
+    const page = await ozonApiCallWithRetry('/v1/delivery-point/list', { pagination: { cursor: cursor, limit: 100 } });
     (page && Array.isArray(page.delivery_points) ? page.delivery_points : []).forEach(p => ids.push(p.delivery_point_id));
     cursor = page && page.next_cursor ? page.next_cursor : null;
     pages++;
@@ -224,7 +241,7 @@ async function loadAllDeliveryPoints() {
   const points = [];
   for (let i = 0; i < batches.length; i += DELIVERY_POINTS_PARALLEL) {
     const chunk = batches.slice(i, i + DELIVERY_POINTS_PARALLEL);
-    const responses = await Promise.all(chunk.map(batch => ozonApiCall('/v1/delivery-point/info', { delivery_point_ids: batch })));
+    const responses = await Promise.all(chunk.map(batch => ozonApiCallWithRetry('/v1/delivery-point/info', { delivery_point_ids: batch })));
     responses.forEach(r => {
       (r && Array.isArray(r.delivery_points) ? r.delivery_points : []).forEach(p => {
         points.push({
