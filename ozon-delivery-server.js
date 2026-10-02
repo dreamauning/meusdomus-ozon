@@ -538,18 +538,23 @@ app.get('/api/ozon-debug', async (req, res) => {
     }
 
     const digits = params.phone.replace(/\D/g, '');
+    const asIs = params.pkg;
+    const minWeight = Object.assign({}, asIs, { weightGrams: Math.max(asIs.weightGrams, 100) });
+    const minDims = Object.assign({}, asIs, { lengthCm: Math.max(asIs.lengthCm, 15), widthCm: Math.max(asIs.widthCm, 10), heightCm: Math.max(asIs.heightCm, 5) });
+    const minBoth = Object.assign({}, minDims, { weightGrams: Math.max(asIs.weightGrams, 100) });
     const variants = [
-      { name: 'как на сайте: +24 часа', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub },
-      { name: 'завтра 12:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(1, 12), declared: params.declaredValueRub },
-      { name: 'завтра 18:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(1, 18), declared: params.declaredValueRub },
-      { name: 'послезавтра 12:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(2, 12), declared: params.declaredValueRub },
-      { name: 'телефон без плюса', phone: digits, cutoffAt: moscowDateAt(1, 12), declared: params.declaredValueRub },
-      { name: 'без объявленной стоимости', phone: params.phone, cutoffAt: moscowDateAt(1, 12), declared: 0 }
+      { name: 'как в заказе', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub, pkg: asIs },
+      { name: 'отгрузка завтра 12:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(1, 12), declared: params.declaredValueRub, pkg: asIs },
+      { name: 'телефон без плюса', phone: digits, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub, pkg: asIs },
+      { name: 'вес не меньше 100 г', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub, pkg: minWeight },
+      { name: 'размер не меньше 15×10×5 см', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub, pkg: minDims },
+      { name: 'вес 100 г и размер 15×10×5 см', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub, pkg: minBoth },
+      { name: 'объявленная стоимость 500 ₽', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: Math.max(params.declaredValueRub, 500), pkg: asIs }
     ];
 
     report.attempts = [];
     for (const v of variants) {
-      const body = buildCheckoutBody(v.phone, params.deliveryPointId, params.pkg, v.declared, v.cutoffAt);
+      const body = buildCheckoutBody(v.phone, params.deliveryPointId, v.pkg, v.declared, v.cutoffAt);
       const attempt = { variant: v.name, cutoff_at: v.cutoffAt };
       try {
         const resp = await ozonApiCall('/v1/order/checkout', body);
