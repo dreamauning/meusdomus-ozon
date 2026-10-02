@@ -295,14 +295,29 @@ function getAllDeliveryPoints() {
 }
 
 function normalizePlace(text) {
-  return String(text || '').trim().toLowerCase().replace(/ё/g, 'е').replace(/^(г\.?|город)\s+/, '').replace(/\s+г\.?$/, '');
+  return String(text || '').trim().toLowerCase().replace(/ё/g, 'е')
+    .replace(/^(г|город|пгт|рп|с|п|д|ст-ца|х|аул|село|поселок|деревня|станица)\.?\s+/, '')
+    .replace(/\s+(г|город)\.?$/, '');
 }
 
-function pointsInCity(points, city) {
-  const exact = points.filter(p => p.is_active && addressInCity(p.full_address, city));
-  if (exact.length) return exact;
+function regionKey(region) {
+  const words = String(region || '').trim().toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я\s-]/g, ' ').split(/\s+/)
+    .filter(w => w && ['обл', 'область', 'респ', 'республика', 'край', 'ао', 'авт', 'автономный', 'округ', 'г'].indexOf(w) === -1);
+  return words[0] || '';
+}
+
+function pointsInCity(points, city, region) {
   const target = normalizePlace(city);
-  return points.filter(p => p.is_active && String(p.full_address || '').toLowerCase().replace(/ё/g, 'е').indexOf(target) !== -1);
+  let found = points.filter(p => p.is_active && addressInCity(p.full_address, city));
+  if (!found.length) {
+    found = points.filter(p => p.is_active && String(p.full_address || '').toLowerCase().replace(/ё/g, 'е').indexOf(target) !== -1);
+  }
+  const key = regionKey(region);
+  if (key) {
+    const inRegion = found.filter(p => String(p.full_address || '').toLowerCase().replace(/ё/g, 'е').indexOf(key) !== -1);
+    if (inRegion.length) found = inRegion;
+  }
+  return found;
 }
 
 function addressInCity(fullAddress, city) {
@@ -319,7 +334,7 @@ app.get('/api/ozon-points', async (req, res) => {
     }
 
     const allPoints = await getAllDeliveryPoints();
-    const matched = pointsInCity(allPoints, cityName);
+    const matched = pointsInCity(allPoints, cityName, req.query.region);
 
     const formatted = matched.map(p => ({
       id: 'ozon-' + p.delivery_point_id,
@@ -481,7 +496,7 @@ app.get('/api/ozon-debug', async (req, res) => {
   try {
     if (!params.deliveryPointId && req.query.city) {
       const city = String(req.query.city).trim().toLowerCase();
-      const cityPoints = pointsInCity(await getAllDeliveryPoints(), city);
+      const cityPoints = pointsInCity(await getAllDeliveryPoints(), city, req.query.region);
       if (!cityPoints.length) return res.json({ error: 'В городе ' + city + ' не найдено пунктов Ozon' });
       params.deliveryPointId = cityPoints[0].delivery_point_id;
       report.deliveryPoint = { id: cityPoints[0].delivery_point_id, address: cityPoints[0].full_address };
