@@ -273,6 +273,7 @@ async function loadAllDeliveryPoints() {
 }
 
 let deliveryPointsLoading = null;
+let deliveryPointsById = new Map();
 
 function getAllDeliveryPoints() {
   const fresh = deliveryPointsCache.length && (Date.now() - deliveryPointsCachedAt) < DELIVERY_POINTS_CACHE_TTL_MS;
@@ -281,6 +282,7 @@ function getAllDeliveryPoints() {
     deliveryPointsLoading = loadAllDeliveryPoints()
       .then(points => {
         deliveryPointsCache = points;
+        deliveryPointsById = new Map(points.map(p => [Number(p.delivery_point_id), p]));
         deliveryPointsCachedAt = Date.now();
         return points;
       })
@@ -426,10 +428,15 @@ function readCalculateParams(query) {
 async function calculateOzonDelivery(params) {
   const trace = {};
 
-  try {
-    trace.checkClient = await ozonApiCall('/v1/delivery/check-client', { phone_number: params.phone });
-  } catch (err) {
-    trace.checkClientError = ozonErrorText(err);
+  for (let attempt = 0; attempt < 2 && trace.checkClient === undefined; attempt++) {
+    try {
+      trace.checkClient = await ozonApiCall('/v1/delivery/check-client', { phone_number: params.phone }, null, 10000);
+    } catch (err) {
+      trace.checkClientError = ozonErrorText(err);
+      if (err.status) break;
+    }
+  }
+  if (trace.checkClient === undefined) {
     console.error('[ozon-calculate] check-client:', trace.checkClientError);
   }
   const eligible = firstDefined(trace.checkClient, ['can_be_delivered', 'is_available', 'available']);
@@ -439,11 +446,23 @@ async function calculateOzonDelivery(params) {
 
   const body = buildCheckoutBody(params.phone, params.deliveryPointId, params.pkg, params.declaredValueRub);
   trace.checkoutRequest = body;
+  const logRefusal = (reason) => {
+    const point = deliveryPointsById.get(Number(params.deliveryPointId));
+    console.error('[ozon-calculate] отказ Ozon:', reason, '| запрос:', JSON.stringify({
+      pointId: params.deliveryPointId,
+      pointAddress: point ? point.full_address : 'нет в кэше',
+      phone: params.phone.replace(/\d(?=\d{4})/g, '*'),
+      weightGrams: params.pkg.weightGrams,
+      dimensionsCm: [params.pkg.lengthCm, params.pkg.widthCm, params.pkg.heightCm].join('×'),
+      declaredValue: params.declaredValueRub,
+      cutoffAt: body.postings[0].cutoff_at
+    }));
+  };
   try {
     trace.checkout = await ozonApiCall('/v1/order/checkout', body);
   } catch (err) {
     trace.checkoutError = ozonErrorText(err);
-    console.error('[ozon-calculate] checkout:', trace.checkoutError, JSON.stringify(err.ozonResponse || ''));
+    logRefusal(trace.checkoutError);
     return { found: false, error: 'Ozon: ' + trace.checkoutError, trace };
   }
   console.log('[ozon-calculate] checkout:', JSON.stringify(trace.checkout));
@@ -453,6 +472,7 @@ async function calculateOzonDelivery(params) {
     return { found: false, error: 'Ozon не вернул расчёт', trace };
   }
   if (posting.error) {
+    logRefusal(posting.error.code || posting.error.message);
     return { found: false, error: 'Ozon: ' + String(posting.error.message || posting.error).slice(0, 160), trace };
   }
 
@@ -503,6 +523,13 @@ app.get('/api/ozon-debug', async (req, res) => {
       report.otherPoints = cityPoints.slice(1, 3).map(p => ({ id: p.delivery_point_id, address: p.full_address }));
     }
     if (!params.phone || !params.deliveryPointId) return res.json({ error: 'Нужны phone и deliveryPointId (или city)' });
+
+    try {
+      const info = await ozonApiCall('/v1/delivery-point/info', { delivery_point_ids: [params.deliveryPointId] });
+      report.pointInfo = info && Array.isArray(info.delivery_points) ? info.delivery_points[0] : info;
+    } catch (err) {
+      report.pointInfo = { error: ozonErrorText(err) };
+    }
 
     try {
       report.checkClient = await ozonApiCall('/v1/delivery/check-client', { phone_number: params.phone });
