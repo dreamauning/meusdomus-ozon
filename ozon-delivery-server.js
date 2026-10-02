@@ -294,6 +294,23 @@ function getAllDeliveryPoints() {
   return deliveryPointsCache.length ? Promise.resolve(deliveryPointsCache) : deliveryPointsLoading;
 }
 
+function normalizePlace(text) {
+  return String(text || '').trim().toLowerCase().replace(/ё/g, 'е').replace(/^(г\.?|город)\s+/, '').replace(/\s+г\.?$/, '');
+}
+
+function pointsInCity(points, city) {
+  const exact = points.filter(p => p.is_active && addressInCity(p.full_address, city));
+  if (exact.length) return exact;
+  const target = normalizePlace(city);
+  return points.filter(p => p.is_active && String(p.full_address || '').toLowerCase().replace(/ё/g, 'е').indexOf(target) !== -1);
+}
+
+function addressInCity(fullAddress, city) {
+  const target = normalizePlace(city);
+  if (!target) return false;
+  return String(fullAddress || '').split(',').some(part => normalizePlace(part) === target);
+}
+
 app.get('/api/ozon-points', async (req, res) => {
   try {
     const cityName = (req.query.city || '').trim().toLowerCase();
@@ -302,9 +319,7 @@ app.get('/api/ozon-points', async (req, res) => {
     }
 
     const allPoints = await getAllDeliveryPoints();
-    const matched = allPoints.filter(p =>
-      p.is_active && (p.full_address || '').toLowerCase().indexOf(cityName) !== -1
-    );
+    const matched = pointsInCity(allPoints, cityName);
 
     const formatted = matched.map(p => ({
       id: 'ozon-' + p.delivery_point_id,
@@ -466,7 +481,7 @@ app.get('/api/ozon-debug', async (req, res) => {
   try {
     if (!params.deliveryPointId && req.query.city) {
       const city = String(req.query.city).trim().toLowerCase();
-      const cityPoints = (await getAllDeliveryPoints()).filter(p => p.is_active && (p.full_address || '').toLowerCase().indexOf(city) !== -1);
+      const cityPoints = pointsInCity(await getAllDeliveryPoints(), city);
       if (!cityPoints.length) return res.json({ error: 'В городе ' + city + ' не найдено пунктов Ozon' });
       params.deliveryPointId = cityPoints[0].delivery_point_id;
       report.deliveryPoint = { id: cityPoints[0].delivery_point_id, address: cityPoints[0].full_address };
