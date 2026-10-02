@@ -15,6 +15,8 @@ const OZON_MARKUP_PERCENT = 5;
 const OZON_DEBUG_KEY = 'md-diag-5f81c2';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
 const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const DELIVERY_POINTS_MAX_PAGES = 3000;
+const DELIVERY_POINTS_PARALLEL = 5;
 
 const app = express();
 app.use(cors());
@@ -204,42 +206,51 @@ async function ozonApiCall(endpoint, body, extraHeaders) {
 let deliveryPointsCache = [];
 let deliveryPointsCachedAt = 0;
 
-async function getAllDeliveryPoints() {
-  const now = Date.now();
-  if (deliveryPointsCache.length && (now - deliveryPointsCachedAt) < DELIVERY_POINTS_CACHE_TTL_MS) {
-    return deliveryPointsCache;
-  }
-
+async function loadAllDeliveryPoints() {
   console.log('[ozon] Обновляем кэш пунктов выдачи...');
-  let allPoints = [];
-  let cursor = undefined;
-  let pageGuard = 0;
-
+  const ids = [];
+  let cursor;
+  let pages = 0;
   do {
-    const page = await ozonApiCall('/v1/delivery-point/list', {
-      pagination: { cursor: cursor, limit: 100 }
-    });
-    if (page && Array.isArray(page.delivery_points)) {
-      allPoints = allPoints.concat(page.delivery_points);
-    }
+    const page = await ozonApiCall('/v1/delivery-point/list', { pagination: { cursor: cursor, limit: 100 } });
+    (page && Array.isArray(page.delivery_points) ? page.delivery_points : []).forEach(p => ids.push(p.delivery_point_id));
     cursor = page && page.next_cursor ? page.next_cursor : null;
-    pageGuard++;
-  } while (cursor && pageGuard < 200);
+    pages++;
+  } while (cursor && pages < DELIVERY_POINTS_MAX_PAGES);
+  if (cursor) console.warn(`[ozon] Достигнут предел ${DELIVERY_POINTS_MAX_PAGES} страниц — часть пунктов не загружена`);
 
-  var fullPoints = [];
-  for (let i = 0; i < allPoints.length; i += 100) {
-    const batchIds = allPoints.slice(i, i + 100).map(p => p.delivery_point_id);
-    if (!batchIds.length) continue;
-    const infoResp = await ozonApiCall('/v1/delivery-point/info', { delivery_point_ids: batchIds });
-    if (infoResp && Array.isArray(infoResp.delivery_points)) {
-      fullPoints = fullPoints.concat(infoResp.delivery_points);
-    }
+  const batches = [];
+  for (let i = 0; i < ids.length; i += 100) batches.push(ids.slice(i, i + 100));
+  const points = [];
+  for (let i = 0; i < batches.length; i += DELIVERY_POINTS_PARALLEL) {
+    const chunk = batches.slice(i, i + DELIVERY_POINTS_PARALLEL);
+    const responses = await Promise.all(chunk.map(batch => ozonApiCall('/v1/delivery-point/info', { delivery_point_ids: batch })));
+    responses.forEach(r => { if (r && Array.isArray(r.delivery_points)) points.push(...r.delivery_points); });
   }
+  console.log(`[ozon] Кэш обновлён: ${points.length} пунктов выдачи`);
+  return points;
+}
 
-  deliveryPointsCache = fullPoints;
-  deliveryPointsCachedAt = now;
-  console.log(`[ozon] Кэш обновлён: ${fullPoints.length} пунктов выдачи`);
-  return deliveryPointsCache;
+let deliveryPointsLoading = null;
+
+function getAllDeliveryPoints() {
+  const fresh = deliveryPointsCache.length && (Date.now() - deliveryPointsCachedAt) < DELIVERY_POINTS_CACHE_TTL_MS;
+  if (fresh) return Promise.resolve(deliveryPointsCache);
+  if (!deliveryPointsLoading) {
+    deliveryPointsLoading = loadAllDeliveryPoints()
+      .then(points => {
+        deliveryPointsCache = points;
+        deliveryPointsCachedAt = Date.now();
+        return points;
+      })
+      .catch(err => {
+        console.error('[ozon] Не удалось обновить кэш пунктов:', err.message);
+        if (deliveryPointsCache.length) return deliveryPointsCache;
+        throw err;
+      })
+      .finally(() => { deliveryPointsLoading = null; });
+  }
+  return deliveryPointsCache.length ? Promise.resolve(deliveryPointsCache) : deliveryPointsLoading;
 }
 
 app.get('/api/ozon-points', async (req, res) => {
@@ -298,13 +309,23 @@ function ozonErrorText(err) {
   return String(msg).slice(0, 160);
 }
 
-function buildCheckoutBody(phone, deliveryPointId, pkg, declaredValueRub) {
+function defaultCutoffAt() {
+  return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+}
+
+function moscowDateAt(daysAhead, hour) {
+  const now = new Date();
+  const moscow = new Date(now.getTime() + 3 * 60 * 60 * 1000);
+  return new Date(Date.UTC(moscow.getUTCFullYear(), moscow.getUTCMonth(), moscow.getUTCDate() + daysAhead, hour - 3, 0, 0)).toISOString();
+}
+
+function buildCheckoutBody(phone, deliveryPointId, pkg, declaredValueRub, cutoffAt) {
   return {
     recipient: { phone_number: phone },
     postings: [{
       request_id: 1,
       shipment_method_id: OZON_SHIPMENT_METHOD_ID,
-      cutoff_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      cutoff_at: cutoffAt || defaultCutoffAt(),
       declared_value: { amount: declaredValueRub.toFixed(2), currency_code: 'RUB' },
       dimensions: {
         weight_g: pkg.weightGrams,
@@ -399,10 +420,72 @@ app.get('/api/ozon-calculate', async (req, res) => {
 app.get('/api/ozon-debug', async (req, res) => {
   if (req.query.key !== OZON_DEBUG_KEY) return res.status(403).json({ error: 'forbidden' });
   const params = readCalculateParams(req.query);
+  const report = { shipmentMethodId: OZON_SHIPMENT_METHOD_ID };
+
   try {
-    res.json(await calculateOzonDelivery(params));
+    if (!params.deliveryPointId && req.query.city) {
+      const city = String(req.query.city).trim().toLowerCase();
+      const cityPoints = (await getAllDeliveryPoints()).filter(p => p.is_active && (p.full_address || '').toLowerCase().indexOf(city) !== -1);
+      if (!cityPoints.length) return res.json({ error: 'В городе ' + city + ' не найдено пунктов Ozon' });
+      params.deliveryPointId = cityPoints[0].delivery_point_id;
+      report.deliveryPoint = { id: cityPoints[0].delivery_point_id, address: cityPoints[0].full_address };
+      report.otherPoints = cityPoints.slice(1, 3).map(p => ({ id: p.delivery_point_id, address: p.full_address }));
+    }
+    if (!params.phone || !params.deliveryPointId) return res.json({ error: 'Нужны phone и deliveryPointId (или city)' });
+
+    try {
+      report.checkClient = await ozonApiCall('/v1/delivery/check-client', { phone_number: params.phone });
+    } catch (err) {
+      report.checkClient = { error: ozonErrorText(err), raw: err.ozonResponse || null };
+    }
+
+    const digits = params.phone.replace(/\D/g, '');
+    const variants = [
+      { name: 'как на сайте: +24 часа', phone: params.phone, cutoffAt: defaultCutoffAt(), declared: params.declaredValueRub },
+      { name: 'завтра 12:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(1, 12), declared: params.declaredValueRub },
+      { name: 'завтра 18:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(1, 18), declared: params.declaredValueRub },
+      { name: 'послезавтра 12:00 МСК', phone: params.phone, cutoffAt: moscowDateAt(2, 12), declared: params.declaredValueRub },
+      { name: 'телефон без плюса', phone: digits, cutoffAt: moscowDateAt(1, 12), declared: params.declaredValueRub },
+      { name: 'без объявленной стоимости', phone: params.phone, cutoffAt: moscowDateAt(1, 12), declared: 0 }
+    ];
+
+    report.attempts = [];
+    for (const v of variants) {
+      const body = buildCheckoutBody(v.phone, params.deliveryPointId, params.pkg, v.declared, v.cutoffAt);
+      const attempt = { variant: v.name, cutoff_at: v.cutoffAt };
+      try {
+        const resp = await ozonApiCall('/v1/order/checkout', body);
+        const posting = extractPosting(resp);
+        attempt.ok = !!(posting && !posting.error);
+        attempt.response = resp;
+      } catch (err) {
+        attempt.ok = false;
+        attempt.error = ozonErrorText(err);
+        attempt.raw = err.ozonResponse || null;
+      }
+      report.attempts.push(attempt);
+    }
+    for (const other of (report.otherPoints || [])) {
+      const attempt = { variant: 'другой пункт: ' + other.address, cutoff_at: moscowDateAt(1, 12) };
+      try {
+        const resp = await ozonApiCall('/v1/order/checkout', buildCheckoutBody(params.phone, other.id, params.pkg, params.declaredValueRub, attempt.cutoff_at));
+        const posting = extractPosting(resp);
+        attempt.ok = !!(posting && !posting.error);
+        attempt.response = resp;
+      } catch (err) {
+        attempt.ok = false;
+        attempt.error = ozonErrorText(err);
+      }
+      report.attempts.push(attempt);
+    }
+    report.requestExample = buildCheckoutBody(params.phone, params.deliveryPointId, params.pkg, params.declaredValueRub, moscowDateAt(1, 12));
+    report.summary = report.attempts.some(a => a.ok)
+      ? 'Сработали варианты: ' + report.attempts.filter(a => a.ok).map(a => a.variant).join(', ')
+      : 'Ни один вариант не прошёл — вероятнее всего, причина на стороне настроек договора или метода доставки в Ozon';
+    res.json(report);
   } catch (err) {
-    res.json({ error: String(err.message || err) });
+    report.error = String(err.message || err);
+    res.json(report);
   }
 });
 
