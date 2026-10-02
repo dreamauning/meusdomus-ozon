@@ -223,6 +223,19 @@ async function ozonApiCallWithRetry(endpoint, body) {
   }
 }
 
+async function fetchPointsInfo(ids) {
+  try {
+    return await ozonApiCallWithRetry('/v1/delivery-point/info', { delivery_point_ids: ids });
+  } catch (err) {
+    const message = err.ozonResponse && err.ozonResponse.error && err.ozonResponse.error.message;
+    if (err.status !== 404 || !message) throw err;
+    const missing = new Set((String(message).match(/\d+/g) || []).map(Number));
+    const remaining = ids.filter(id => !missing.has(Number(id)));
+    if (!remaining.length || remaining.length === ids.length) return { delivery_points: [] };
+    return fetchPointsInfo(remaining);
+  }
+}
+
 async function loadAllDeliveryPoints() {
   console.log('[ozon] Обновляем кэш пунктов выдачи...');
   const ids = [];
@@ -241,7 +254,7 @@ async function loadAllDeliveryPoints() {
   const points = [];
   for (let i = 0; i < batches.length; i += DELIVERY_POINTS_PARALLEL) {
     const chunk = batches.slice(i, i + DELIVERY_POINTS_PARALLEL);
-    const responses = await Promise.all(chunk.map(batch => ozonApiCallWithRetry('/v1/delivery-point/info', { delivery_point_ids: batch })));
+    const responses = await Promise.all(chunk.map(fetchPointsInfo));
     responses.forEach(r => {
       (r && Array.isArray(r.delivery_points) ? r.delivery_points : []).forEach(p => {
         points.push({
