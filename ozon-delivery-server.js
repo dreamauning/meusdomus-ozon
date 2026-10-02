@@ -225,7 +225,18 @@ async function loadAllDeliveryPoints() {
   for (let i = 0; i < batches.length; i += DELIVERY_POINTS_PARALLEL) {
     const chunk = batches.slice(i, i + DELIVERY_POINTS_PARALLEL);
     const responses = await Promise.all(chunk.map(batch => ozonApiCall('/v1/delivery-point/info', { delivery_point_ids: batch })));
-    responses.forEach(r => { if (r && Array.isArray(r.delivery_points)) points.push(...r.delivery_points); });
+    responses.forEach(r => {
+      (r && Array.isArray(r.delivery_points) ? r.delivery_points : []).forEach(p => {
+        points.push({
+          delivery_point_id: p.delivery_point_id,
+          delivery_point_number: p.delivery_point_number,
+          name: p.name,
+          full_address: p.full_address,
+          coordinates: p.coordinates ? { latitude: p.coordinates.latitude, longitude: p.coordinates.longitude } : null,
+          is_active: p.is_active
+        });
+      });
+    });
   }
   console.log(`[ozon] Кэш обновлён: ${points.length} пунктов выдачи`);
   return points;
