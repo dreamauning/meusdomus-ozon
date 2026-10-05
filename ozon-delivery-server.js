@@ -613,6 +613,21 @@ async function writeTrackingToSheet(orderNumber, trackNumber) {
   return await response.json();
 }
 
+async function saveTrackingResultHtml(orderNumber, trackNumber) {
+  let result = null;
+  try {
+    result = await writeTrackingToSheet(orderNumber, trackNumber);
+  } catch (err) {
+    console.error('[tracking] Не удалось записать трек-номер ' + trackNumber + ' для ' + orderNumber + ':', err.message);
+  }
+  if (result && result.success) {
+    return '<p>Трек-номер записан в таблицу — покупателю отправлено письмо с ним.</p>';
+  }
+  const reason = result && result.error ? result.error : 'нет связи с таблицей';
+  console.error('[tracking] Таблица не приняла трек-номер ' + trackNumber + ' для ' + orderNumber + ':', reason);
+  return '<p class="err">Трек-номер не записался в таблицу (' + reason + '). Впишите <b>' + trackNumber + '</b> в колонку K заказа ' + orderNumber + ' вручную — покупатель получит письмо.</p>';
+}
+
 function htmlPage(title, bodyHtml) {
   return '<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><title>' + title + '</title>'
     + '<style>'
@@ -623,6 +638,66 @@ function htmlPage(title, bodyHtml) {
     + 'a.btn{display:inline-block; margin-top:16px; background:#2A1E15; color:#fff; padding:12px 20px; border-radius:8px; text-decoration:none; font-weight:600;}'
     + '</style></head><body><div class="card">' + bodyHtml + '</div></body></html>';
 }
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+function ozonErrorCode(err) {
+  const r = err && err.ozonResponse;
+  return (r && ((r.error && r.error.code) || r.code)) || '';
+}
+
+async function approveAndGetLabel(postingNumber) {
+  const result = { labelBase64: null, error: null };
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await ozonApiCall('/v1/posting/approve', { posting_number: postingNumber });
+      break;
+    } catch (err) {
+      result.error = ozonErrorText(err);
+      console.warn('[ozon-label] approve ' + postingNumber + ':', ozonErrorCode(err), result.error);
+      if (ozonErrorCode(err) !== 'posting_incorrect_state') break;
+      await sleep(3000);
+    }
+  }
+  try {
+    const labelResp = await ozonApiCall('/v1/posting/label', { posting_number: postingNumber });
+    if (labelResp && labelResp.file_content) {
+      result.labelBase64 = labelResp.file_content;
+      result.error = null;
+    } else {
+      result.error = result.error || 'Ozon не вернул файл этикетки';
+    }
+  } catch (err) {
+    result.error = ozonErrorText(err);
+    console.warn('[ozon-label] label ' + postingNumber + ':', ozonErrorCode(err), result.error);
+  }
+  return result;
+}
+
+function labelBlockHtml(postingNumber, label) {
+  const dropoff = '<p style="margin-top:20px; font-size:14px; color:#6b5d4f;">Довезите посылку с этикеткой до пункта отгрузки Ozon (' + OZON_DROPOFF_ADDRESS + ').</p>';
+  if (label.labelBase64) {
+    return '<a class="btn" href="data:application/pdf;base64,' + label.labelBase64 + '" download="ozon-' + postingNumber + '.pdf">Скачать этикетку (PDF)</a>' + dropoff;
+  }
+  return '<p>Ozon пока не выдал этикетку' + (label.error ? ' (' + label.error + ')' : '') + '. Обычно она появляется через пару минут.</p>'
+    + '<a class="btn" href="/api/ozon-label?postingNumber=' + encodeURIComponent(postingNumber) + '">Получить этикетку ещё раз</a>'
+    + '<p style="margin-top:14px; font-size:14px; color:#6b5d4f;">Создавать отправление заново не нужно — оно уже есть в Ozon. Этикетку также можно распечатать из кабинета Ozon по номеру ' + postingNumber + '.</p>'
+    + dropoff;
+}
+
+app.get('/api/ozon-label', async (req, res) => {
+  const postingNumber = String(req.query.postingNumber || '').trim();
+  if (!postingNumber) return res.status(400).send(htmlPage('Ошибка', '<h1 class="err">Не передан номер отправления</h1>'));
+  try {
+    const label = await approveAndGetLabel(postingNumber);
+    res.send(htmlPage(label.labelBase64 ? 'Этикетка готова' : 'Этикетка ещё не готова',
+      '<h1' + (label.labelBase64 ? ' class="ok">Этикетка готова' : '>Этикетка ещё не готова') + '</h1>'
+      + '<p>Номер отправления Ozon: <b>' + postingNumber + '</b></p>'
+      + labelBlockHtml(postingNumber, label)));
+  } catch (err) {
+    res.status(500).send(htmlPage('Ошибка', '<h1 class="err">Не удалось получить этикетку</h1><p>' + String(err.message || err) + '</p>'));
+  }
+});
 
 app.get('/api/create-ozon-order', async (req, res) => {
   var orderNumber = String(req.query.orderNumber || '').trim();
@@ -637,7 +712,8 @@ app.get('/api/create-ozon-order', async (req, res) => {
     }
 
     if (order.trackNumber) {
-      return res.send(htmlPage('Уже создано', '<h1>Отправка уже была создана ранее</h1><p>Трек-номер: <b>' + order.trackNumber + '</b></p><p>Письмо покупателю уже отправлено, повторно ничего создавать не нужно.</p>'));
+      return res.send(htmlPage('Уже создано', '<h1>Отправка уже была создана ранее</h1><p>Номер отправления Ozon: <b>' + order.trackNumber + '</b></p><p>Письмо покупателю уже отправлено, повторно ничего создавать не нужно.</p>'
+        + '<a class="btn" href="/api/ozon-label?postingNumber=' + encodeURIComponent(order.trackNumber) + '">Получить этикетку</a>'));
     }
 
     if (!order.ozonDeliveryPointId) {
@@ -689,26 +765,12 @@ app.get('/api/create-ozon-order', async (req, res) => {
     }
     var postingNumber = posting.posting_number;
 
-    console.log('[create-ozon-order] Подтверждаем отправление ' + postingNumber);
-    await ozonApiCall('/v1/posting/approve', { posting_number: postingNumber });
-
-    var labelResp = await ozonApiCall('/v1/posting/label', { posting_number: postingNumber });
-    var labelBase64 = labelResp && labelResp.file_content;
-
-    await writeTrackingToSheet(orderNumber, postingNumber);
-
-    var labelHtml = '<p>Этикетку не удалось получить автоматически — найдите отправление ' + postingNumber + ' в личном кабинете Ozon и распечатайте её оттуда.</p>';
-    if (labelBase64) {
-      labelHtml = '<a class="btn" href="data:application/pdf;base64,' + labelBase64 + '" download="ozon-' + postingNumber + '.pdf">Скачать этикетку (PDF)</a>';
-    }
-
-    res.send(htmlPage('Готово',
-      '<h1 class="ok">Отправка создана</h1>'
+    const savedToSheet = await saveTrackingResultHtml(orderNumber, postingNumber);
+    const label = await approveAndGetLabel(postingNumber);
+    res.send(htmlPage('Готово', '<h1 class="ok">Отправка создана</h1>'
       + '<p>Номер отправления Ozon: <b>' + postingNumber + '</b></p>'
-      + '<p>Трек-номер записан в таблицу — покупателю уже отправлено письмо с ним.</p>'
-      + labelHtml
-      + '<p style="margin-top:20px; font-size:14px; color:#6b5d4f;">Довезите посылку с этой этикеткой до пункта отгрузки Ozon (' + OZON_DROPOFF_ADDRESS + ').</p>'
-    ));
+      + savedToSheet
+      + labelBlockHtml(postingNumber, label)));
   } catch (err) {
     console.error('[create-ozon-order] Ошибка:', err);
     res.status(500).send(htmlPage('Ошибка', '<h1 class="err">Что-то пошло не так</h1><p>' + String(err.message || err) + '</p><p>Заказ ' + orderNumber + ' нужно будет создать вручную в кабинете Ozon.</p>'));
