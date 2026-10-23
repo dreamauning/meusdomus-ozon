@@ -14,6 +14,7 @@ const OZON_DROPOFF_ADDRESS = 'Авиамоторная ул., 6 стр. 4';
 const OZON_MARKUP_PERCENT = 5;
 const OZON_MIN_DECLARED_VALUE = 500;
 const OZON_DEBUG_KEY = 'md-diag-5f81c2';
+const SERVER_SECRET = '8804b961cee24d6e8828c7541172140e1672b1b6';
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
 const DELIVERY_POINTS_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const DELIVERY_POINTS_MAX_PAGES = 3000;
@@ -598,8 +599,8 @@ function idempotencyKeyFromOrderNumber(orderNumber) {
   return [hash.slice(0,8), hash.slice(8,12), hash.slice(12,16), hash.slice(16,20), hash.slice(20,32)].join('-');
 }
 
-async function fetchOrderFromSheet(orderNumber) {
-  const url = APPS_SCRIPT_URL + '?action=order-lookup&orderNumber=' + encodeURIComponent(orderNumber);
+async function fetchOrderFromSheet(orderNumber, access) {
+  const url = APPS_SCRIPT_URL + '?action=order-lookup&orderNumber=' + encodeURIComponent(orderNumber) + '&key=' + SERVER_SECRET + '&access=' + encodeURIComponent(access || '');
   const response = await fetch(url);
   return await response.json();
 }
@@ -608,7 +609,7 @@ async function writeTrackingToSheet(orderNumber, trackNumber) {
   const response = await fetch(APPS_SCRIPT_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify({ type: 'set-tracking', orderNumber: orderNumber, trackNumber: trackNumber })
+    body: JSON.stringify({ type: 'set-tracking', key: SERVER_SECRET, orderNumber: orderNumber, trackNumber: trackNumber })
   });
   return await response.json();
 }
@@ -706,7 +707,10 @@ app.get('/api/create-ozon-order', async (req, res) => {
   }
 
   try {
-    var order = await fetchOrderFromSheet(orderNumber);
+    var order = await fetchOrderFromSheet(orderNumber, req.query.key);
+    if (order.error === 'forbidden') {
+      return res.status(403).send(htmlPage('Ссылка недействительна', '<h1 class="err">Ссылка недействительна</h1><p>Откройте заказ в кабинете менеджера и нажмите «Создать отправку» там.</p>'));
+    }
     if (!order.found) {
       return res.send(htmlPage('Заказ не найден', '<h1 class="err">Заказ не найден</h1><p>' + (order.error || 'Проверьте номер заказа.') + '</p>'));
     }
